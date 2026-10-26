@@ -17,7 +17,7 @@ openai>=1.55.0
 openapi
 pathlib2
 prompt_toolkit>=3.0.0
-pydantic-settings>=2.14.2
+pydantic-settings>=2.16.1
 pypdf>=6.19.0
 PyYAML>=6.0
 reportlab>=3.5.0
