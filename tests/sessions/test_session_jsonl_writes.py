@@ -1,0 +1,238 @@
+"""Writing a session file never costs a line already in it.
+
+A message is appended to ``session.jsonl``; the file is rewritten only when
+its header has to change (a title, metadata, a task), and a line that cannot
+be read, such as one cut short by a crash, is kept as it is.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from core.sessions import SessionStore
+
+# What a crash in the middle of an append leaves: a line cut short, without
+# its newline, here even inside a character.
+_TORN = '{"_type": "message", "role": "assistant", "content": "回复'.encode()[:-1]
+
+
+def _lines(store: SessionStore, session_id: str) -> list[bytes]:
+    path = store.root / session_id / "session.jsonl"
+    return path.read_bytes().splitlines()
+
+
+def test_appending_a_message_appends(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(title="kept")
+    path = store.root / session.session_id / "session.jsonl"
+    store.append_message(session.session_id, "user", "first")
+    before = path.read_bytes()
+    inode = path.stat().st_ino
+
+    last = store.append_message(session.session_id, "assistant", "second")
+
+    assert path.stat().st_ino == inode
+    assert path.read_bytes().startswith(before)
+    # The newest message dates the session even though the header was not
+    # rewritten for it.
+    reopened = SessionStore(tmp_path / "sessions").get_session(session.session_id)
+    assert reopened is not None
+    assert reopened.updated_at == last.timestamp
+
+
+@pytest.mark.parametrize("use_index", [True, False])
+def test_the_session_with_the_newest_message_lists_first(
+    tmp_path: Path, use_index: bool
+) -> None:
+    store = SessionStore(tmp_path / "sessions", use_index=use_index)
+    older = store.create_session(title="older")
+    store.create_session(title="newer")
+    store.append_message(older.session_id, "user", "back to this one")
+
+    reopened = SessionStore(tmp_path / "sessions", use_index=use_index)
+    assert [summary.title for summary in reopened.list_sessions()] == [
+        "older",
+        "newer",
+    ]
+
+
+def test_a_line_cut_short_by_a_crash_survives_later_writes(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(title="")
+    store.append_message(session.session_id, "user", "first")
+    path = store.root / session.session_id / "session.jsonl"
+    with path.open("ab") as handle:
+        handle.write(_TORN)
+
+    store.append_message(session.session_id, "assistant", "after the crash")
+    store.rename_session(session.session_id, "renamed")
+    store.update_metadata(session.session_id, {"note": "kept"})
+
+    assert _TORN in _lines(store, session.session_id)
+    reopened = SessionStore(tmp_path / "sessions").get_session(session.session_id)
+    assert reopened is not None
+    assert reopened.title == "renamed"
+    assert [message.content for message in reopened.messages] == [
+        "first",
+        "after the crash",
+    ]
+
+
+def test_a_saved_message_or_task_is_on_disk_when_saving_returns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(title="kept")
+    directory = store.root / session.session_id
+    synced: list[int] = []
+    fsync = os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        synced.append(os.fstat(descriptor).st_ino)
+        fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    store.append_message(session.session_id, "user", "first")
+    assert (directory / "session.jsonl").stat().st_ino in synced
+
+    synced.clear()
+    store.attach_task(session.session_id, "task-1", task_kind="paper", task_dir="t")
+    assert (directory / "tasks.jsonl").stat().st_ino in synced
+    if os.name != "nt":
+        # The first task created tasks.jsonl; its directory entry is durable too.
+        assert directory.stat().st_ino in synced
+
+
+def test_a_task_line_cut_short_by_a_crash_survives_later_writes(
+    tmp_path: Path,
+) -> None:
+    torn = '{"_type": "task", "task_id": "任务'.encode()[:-1]
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(title="kept")
+    store.attach_task(session.session_id, "t1", task_kind="paper", task_dir="a")
+    path = store.root / session.session_id / "tasks.jsonl"
+    with path.open("ab") as handle:
+        handle.write(torn)
+
+    store.attach_task(session.session_id, "t2", task_kind="paper", task_dir="b")
+    store.update_task_status(session.session_id, "t1", "completed")
+    store.attach_task(session.session_id, "t2", task_kind="paper", task_dir="c")
+
+    assert torn in path.read_bytes().splitlines()
+    reopened = SessionStore(tmp_path / "sessions").get_session(session.session_id)
+    assert reopened is not None
+    assert [(task.task_id, task.status, task.task_dir) for task in reopened.tasks] == [
+        ("t1", "completed", "a"),
+        ("t2", "pending", "c"),
+    ]
+
+
+def test_an_updated_task_list_is_on_disk_when_saving_returns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(title="kept")
+    store.attach_task(session.session_id, "t1", task_kind="paper", task_dir="a")
+    synced: list[int] = []
+    fsync = os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        synced.append(os.fstat(descriptor).st_ino)
+        fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    store.update_task_status(session.session_id, "t1", "completed")
+
+    tasks = store.root / session.session_id / "tasks.jsonl"
+    assert tasks.stat().st_ino in synced
+
+
+def _count_loads(monkeypatch) -> list[str]:
+    loads: list[str] = []
+    load = SessionStore._load
+
+    def counting_load(self, session_id):
+        loads.append(session_id)
+        return load(self, session_id)
+
+    monkeypatch.setattr(SessionStore, "_load", counting_load)
+    return loads
+
+
+def test_appending_does_not_read_the_session_file_again(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(title="kept")
+    loads = _count_loads(monkeypatch)
+
+    for index in range(50):
+        store.append_message(session.session_id, "user", f"message {index}")
+
+    assert loads == []
+    reopened = SessionStore(tmp_path / "sessions").get_session(session.session_id)
+    assert reopened is not None
+    assert [message.content for message in reopened.messages] == [
+        f"message {index}" for index in range(50)
+    ]
+
+
+def test_a_message_another_writer_appended_is_kept_in_order(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    first, second = SessionStore(root), SessionStore(root)
+    session_id = first.create_session(title="shared").session_id
+
+    first.append_message(session_id, "user", "one")
+    second.append_message(session_id, "assistant", "two")
+    first.append_message(session_id, "user", "three")
+
+    for store in (first, second, SessionStore(root)):
+        current = store.get_session(session_id)
+        assert current is not None
+        assert [message.content for message in current.messages] == [
+            "one",
+            "two",
+            "three",
+        ]
+
+
+def test_a_header_another_writer_replaced_is_seen_even_with_coarse_times(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sessions"
+    first, second = SessionStore(root), SessionStore(root)
+    session_id = first.create_session(title="aaaa").session_id
+    first.append_message(session_id, "user", "one")
+    path = root / session_id / "session.jsonl"
+    before = path.stat()
+
+    second.rename_session(session_id, "bbbb")
+    # A filesystem with coarse timestamps: same size, same time.
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    first.append_message(session_id, "user", "two")
+
+    current = first.get_session(session_id)
+    assert current is not None
+    assert current.title == "bbbb"
+    assert [message.content for message in current.messages] == ["one", "two"]
+
+
+def test_a_failed_append_leaves_no_message_behind(tmp_path: Path, monkeypatch) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session_id = store.create_session(title="kept").session_id
+    store.append_message(session_id, "user", "kept")
+
+    def no_space(*_args, **_kwargs):
+        raise OSError("No space left on device")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_append_jsonl", no_space)
+        with pytest.raises(OSError):
+            store.append_message(session_id, "assistant", "lost")
+
+    current = store.get_session(session_id)
+    assert current is not None
+    assert [message.content for message in current.messages] == ["kept"]

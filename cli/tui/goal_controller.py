@@ -1,0 +1,263 @@
+"""TUI commands for the shared Thread Goal extension."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from core.application.errors import ApplicationError
+from core.config import ConfigError
+from core.domain.message_provenance import ClientSurface
+from core.domain.thread_goal import GoalOutcome, ThreadGoal, ThreadGoalStatus
+
+if TYPE_CHECKING:
+    from cli.tui.app import TuiApp
+
+
+# Actions that take no argument; with trailing text the line is an objective.
+_BARE_ACTIONS = frozenset(
+    {"show", "status", "wait", "pause", "resume", "continue", "clear"}
+)
+_WAIT_POLL_SECONDS = 0.25
+
+
+@dataclass(frozen=True, slots=True)
+class GoalCommandResult:
+    message: str
+    refresh_session: bool = False
+
+
+class TuiGoalController:
+    """Translate explicit `/goal` commands without owning another runtime."""
+
+    def __init__(self, owner: TuiApp) -> None:
+        self.owner = owner
+
+    async def execute(self, raw: str) -> GoalCommandResult:
+        action, _separator, remainder = raw.strip().partition(" ")
+        normalized = action.casefold()
+        if normalized in _BARE_ACTIONS and remainder.strip():
+            # These actions take no argument, so "/goal clear out the dead
+            # flags" is an objective that happens to start with a keyword.
+            # Treating it as "clear" silently discarded the current Goal.
+            normalized = "set"
+            remainder = raw.strip()
+        try:
+            if not action or normalized in {"show", "status"}:
+                return self._status()
+            if normalized == "wait":
+                return await self._wait()
+            if normalized == "pause":
+                return self._pause()
+            if normalized == "resume":
+                return self._resume()
+            if normalized == "continue":
+                return self._continue()
+            if normalized == "clear":
+                return self._clear()
+            if normalized == "edit":
+                return self._edit(remainder, resume=False)
+            if normalized == "reopen":
+                return self._edit(remainder, resume=True)
+            objective = (
+                remainder.strip() if normalized in {"set", "start"} else raw.strip()
+            )
+            if not objective:
+                return GoalCommandResult(self._usage())
+            return self._create(objective)
+        except (ApplicationError, ConfigError, OSError, ValueError) as exc:
+            return GoalCommandResult(f"Goal error: {exc}")
+
+    def close(self) -> None:
+        """The Goal extension is owned by the shared Application."""
+
+    def _status(self) -> GoalCommandResult:
+        application, thread_id = self._context()
+        goal, outcome = application.goals.read_with_outcome(thread_id)
+        return GoalCommandResult(self._format(goal, outcome))
+
+    def _pause(self) -> GoalCommandResult:
+        application, thread_id = self._context()
+        current = self._required(application, thread_id)
+        paused = application.goals.pause(
+            thread_id,
+            expected_goal_id=current.id,
+        )
+        return GoalCommandResult(self._format(paused), refresh_session=True)
+
+    def _resume(self) -> GoalCommandResult:
+        application, thread_id = self._context()
+        current = self._required(application, thread_id)
+        if current.status is ThreadGoalStatus.ACTIVE:
+            return GoalCommandResult("the Session Goal is already active")
+        resumed = application.goals.resume(
+            thread_id,
+            expected_goal_id=current.id,
+            client_surface=ClientSurface.CLI,
+        )
+        return GoalCommandResult(
+            self._format(resumed)
+            + "\nGoal resumed on the shared ordinary-Turn runtime."
+        )
+
+    def _continue(self) -> GoalCommandResult:
+        application, thread_id = self._context()
+        current = self._required(application, thread_id)
+        result = application.goals.continue_goal(
+            thread_id,
+            expected_goal_id=current.id,
+            client_surface=ClientSurface.CLI,
+        )
+        message = (
+            "Goal continuation started on the shared ordinary-Turn runtime."
+            if result.disposition.value == "started"
+            else f"Goal is already running in Turn {result.turn_id}."
+        )
+        return GoalCommandResult(
+            self._format(result.goal) + f"\n{message}",
+            refresh_session=True,
+        )
+
+    def _clear(self) -> GoalCommandResult:
+        application, thread_id = self._context()
+        current = self._required(application, thread_id)
+        application.goals.clear(
+            thread_id,
+            expected_goal_id=current.id,
+        )
+        return GoalCommandResult(
+            "Session Goal cleared; conversation history was preserved.",
+            refresh_session=True,
+        )
+
+    def _edit(self, objective: str, *, resume: bool) -> GoalCommandResult:
+        application, thread_id = self._context()
+        current = self._required(application, thread_id)
+        clean = objective.strip() or current.objective
+        updated = application.goals.edit(
+            thread_id,
+            expected_goal_id=current.id,
+            objective=clean,
+            token_budget=current.token_budget,
+            skill_ids=current.skill_ids,
+            continue_work=True,
+            client_surface=ClientSurface.CLI,
+        )
+        if resume and updated.status is not ThreadGoalStatus.ACTIVE:
+            updated = application.goals.resume(
+                thread_id,
+                expected_goal_id=updated.id,
+                client_surface=ClientSurface.CLI,
+            )
+        return GoalCommandResult(
+            self._format(updated)
+            + "\nGoal saved with the same identity; active work sees the update."
+        )
+
+    def _create(self, objective: str) -> GoalCommandResult:
+        application, thread_id = self._context()
+        existing = application.goals.read(thread_id)
+        if existing is not None:
+            return GoalCommandResult(
+                "this Session already has a Goal; use /goal edit, /goal "
+                "resume, /goal reopen, or /goal clear"
+            )
+        self.owner.bridge.set_title_from(objective)
+        selected_skills = tuple(self.owner.selected_skill_ids)
+        created = application.goals.create(
+            thread_id,
+            objective=objective,
+            skill_ids=selected_skills,
+            start=True,
+            client_surface=ClientSurface.CLI,
+        )
+        self.owner.selected_skill_ids.clear()
+        return GoalCommandResult(
+            self._format(created)
+            + "\nGoal started on the shared ordinary-Turn runtime."
+        )
+
+    async def _wait(self) -> GoalCommandResult:
+        application, thread_id = self._context()
+        current = self._required(application, thread_id)
+        stopped = False
+        try:
+            while current.status is ThreadGoalStatus.ACTIVE:
+                await asyncio.sleep(_WAIT_POLL_SECONDS)
+                # Off the event loop: a slow service must not freeze the UI.
+                current = (
+                    await asyncio.to_thread(application.goals.read, thread_id)
+                    or current
+                )
+            # Goal completion can be persisted by a tool before its deciding
+            # Turn has emitted and rendered the final tool/result events.
+            await self.owner.thread_client.wait_until_idle()
+        except asyncio.CancelledError:
+            # Ctrl-C while waiting: the TUI cancels the running command (see
+            # TuiApp._run_line). Stop waiting; the Goal itself keeps running.
+            task = asyncio.current_task()
+            if task is None or not task.cancelling():
+                raise
+            task.uncancel()
+            stopped = True
+        # Report the Goal as it is now, with its own outcome: the last poll
+        # may be stale by the time the Turn has gone idle.
+        latest, outcome = application.goals.read_with_outcome(thread_id)
+        if latest is not None:
+            current = latest
+        suffix = (
+            "\nStopped waiting; the Goal remains active."
+            if stopped and current.status is ThreadGoalStatus.ACTIVE
+            else ""
+        )
+        return GoalCommandResult(
+            self._format(current, outcome) + suffix,
+            refresh_session=True,
+        )
+
+    def _context(self):
+        return (
+            self.owner.thread_client,
+            self.owner.thread_client.session_id,
+        )
+
+    @staticmethod
+    def _required(
+        application,
+        thread_id: str,
+    ) -> ThreadGoal:
+        goal = application.goals.read(thread_id)
+        if goal is None:
+            raise ValueError("no Goal is attached to this Session")
+        return goal
+
+    @staticmethod
+    def _usage() -> str:
+        return (
+            "usage: /goal <text> | set <text> | show | edit <text> | pause | "
+            "resume | continue | wait | reopen [text] | clear"
+        )
+
+    @staticmethod
+    def _format(
+        goal: ThreadGoal | None,
+        outcome: GoalOutcome | None = None,
+    ) -> str:
+        if goal is None:
+            return "no Goal is attached to this Session"
+        budget = f"/{goal.token_budget}" if goal.token_budget is not None else ""
+        lines = [
+            f"Goal {goal.status.value} · {goal.id} · "
+            f"tokens {goal.tokens_used}{budget} · "
+            f"time {goal.time_used_seconds}s",
+            goal.objective,
+        ]
+        if outcome is not None:
+            lines.append(f"Reason: {outcome.reason}")
+            if outcome.decided_by_turn_id is not None:
+                lines.append(f"Deciding Turn: {outcome.decided_by_turn_id}")
+        return "\n".join(lines)
+
+
+__all__ = ["GoalCommandResult", "TuiGoalController"]

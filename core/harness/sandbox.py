@@ -1,0 +1,687 @@
+"""Platform sandbox command wrapping (mechanism only).
+
+Given a shell command and a :class:`SandboxPolicy`, produce an equivalent
+command that runs confined to a set of writable roots. Three backends:
+
+* **macOS** — ``sandbox-exec`` (seatbelt) with a generated ``.sbpl`` policy
+  that is **closed-by-default** (``(deny default)``, Chrome-inspired, C4b):
+  it denies everything, then re-grants only the narrow set a build needs
+  (process spawn, a curated sysctl allowlist, IPC for Python multiproc /
+  OpenMP, PTYs, user prefs), plus broad reads and writes confined to the
+  policy's roots (and ``/tmp``). The binary is referenced by its absolute
+  path (``/usr/bin/sandbox-exec``) to defend against PATH injection.
+* **Linux** — ``bwrap`` (bubblewrap): mount-namespace isolation — bind the
+  filesystem read-only, bind writable roots read-write, fresh ``/tmp``,
+  ``--unshare-net`` for no network.
+* **Windows** — ``job``: a Windows Job Object with
+  ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` provides process-tree isolation and
+  lifetime management (no orphaned descendants survive the wrapper). The
+  inner command is launched through ``core.harness.windows_sandbox``, the
+  same wrapper pattern as the other backends.
+
+Honest boundary: the reference agent adds seccomp-bpf + Landlock on Linux;
+those are kernel facilities Python cannot install from userspace, so DeepCode
+relies on bubblewrap's namespaces (a real, standard isolation primitive) rather
+than faking an equivalent. On Windows, a userspace write-fence (like seatbelt's
+or bubblewrap's) needs disk quotas or an AppContainer/SILO; the Job Object
+backend intentionally does not fake it — it provides process-tree isolation and
+leaves write restriction to explicit approval.
+
+If no backend is available :func:`sandbox_backend` returns ``"none"`` and
+:func:`wrap_shell_command` returns the command unchanged — callers must decide
+whether to degrade to approval-first. This module never raises for an
+unsupported platform; it degrades.
+
+Network is denied by default (``allow_network=False``) on the seatbelt and
+bwrap backends; the Windows Job Object backend does not gate the network
+(honest boundary above).
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import platform
+import shutil
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from loguru import logger
+
+from core.harness.permissions import (
+    public_files_in_sensitive_locations,
+    sensitive_locations,
+)
+from core.platform_compat import script_command
+
+# Absolute path — never resolved via PATH (PATH-injection defense).
+_MACOS_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+_WINDOWS_JOB_LAUNCHER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "windows_sandbox.py"
+)
+
+
+@dataclass(frozen=True)
+class SandboxPolicy:
+    """What a sandboxed command may write to and whether it has network.
+
+    ``writable_roots`` are absolute directories the command may modify;
+    everything else on disk is read-only. Reads are unrestricted (agents
+    routinely need to read system headers, site-packages, etc.) except for
+    ``unreadable``: credential stores the command may neither read nor write.
+    ``readable`` names files inside them (glob patterns) it may still read.
+    """
+
+    writable_roots: tuple[str, ...] = ()
+    allow_network: bool = False
+    unreadable: tuple[str, ...] = ()
+    readable: tuple[str, ...] = ()
+
+    @classmethod
+    def for_workspace(
+        cls, workspace: str | os.PathLike[str], *, allow_network: bool = False
+    ) -> SandboxPolicy:
+        root = os.path.abspath(str(workspace))
+        return cls(
+            writable_roots=(root,),
+            allow_network=allow_network,
+            unreadable=sensitive_locations(),
+            readable=public_files_in_sensitive_locations(),
+        )
+
+    def normalized_roots(self) -> list[str]:
+        return [os.path.abspath(r) for r in self.writable_roots if r]
+
+
+def sandbox_backend() -> str:
+    """Return the active backend: ``"seatbelt"`` | ``"bwrap"`` | ``"job"`` | ``"none"``."""
+    system = platform.system()
+    if system == "Darwin" and os.path.exists(_MACOS_SANDBOX_EXEC):
+        return "seatbelt"
+    if system == "Linux" and shutil.which("bwrap"):
+        return "bwrap"
+    if system == "Windows":
+        # The Job Object launcher is pure ctypes/stdlib; always available on
+        # native Windows. Exposed as an opt-in backend so callers that need a
+        # strict write-fence can still force approval-first degradation.
+        return "job"
+    return "none"
+
+
+# Closed-by-default (deny default) seatbelt base, aligned with the reference
+# agent's Chrome-inspired policy (C4b hardening). Unlike an ``(allow default)``
+# write-fence — which lets a command do anything except write outside its roots
+# — this denies *everything* and re-grants only the narrow set a build actually
+# needs (process spawn, a curated sysctl allowlist, IPC for Python multiproc/
+# OpenMP, PTYs, user prefs). File reads, workspace writes, and (optional)
+# network are layered on top in ``_seatbelt_profile``.
+_SEATBELT_BASE_POLICY = r"""(version 1)
+
+; Chrome-inspired closed-by-default sandbox policy.
+
+; start with closed-by-default
+(deny default)
+
+; child processes inherit the policy of their parent
+(allow process-exec)
+(allow process-fork)
+(allow signal (target same-sandbox))
+
+; process-info
+(allow process-info* (target same-sandbox))
+
+(allow file-write-data
+  (require-all
+    (path "/dev/null")
+    (vnode-type CHARACTER-DEVICE)))
+
+; sysctls permitted.
+(allow sysctl-read
+  (sysctl-name "hw.activecpu")
+  (sysctl-name "hw.busfrequency_compat")
+  (sysctl-name "hw.byteorder")
+  (sysctl-name "hw.cacheconfig")
+  (sysctl-name "hw.cachelinesize_compat")
+  (sysctl-name "hw.cpufamily")
+  (sysctl-name "hw.cpufrequency_compat")
+  (sysctl-name "hw.cputype")
+  (sysctl-name "hw.l1dcachesize_compat")
+  (sysctl-name "hw.l1icachesize_compat")
+  (sysctl-name "hw.l2cachesize_compat")
+  (sysctl-name "hw.l3cachesize_compat")
+  (sysctl-name "hw.logicalcpu_max")
+  (sysctl-name "hw.machine")
+  (sysctl-name "hw.model")
+  (sysctl-name "hw.memsize")
+  (sysctl-name "hw.ncpu")
+  (sysctl-name "hw.nperflevels")
+  ; CPU feature detection; fingerprinting is not a concern here.
+  (sysctl-name-prefix "hw.optional.arm.")
+  (sysctl-name-prefix "hw.optional.armv8_")
+  (sysctl-name "hw.packages")
+  (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "hw.pagesize")
+  (sysctl-name "hw.physicalcpu")
+  (sysctl-name "hw.physicalcpu_max")
+  (sysctl-name "hw.logicalcpu")
+  (sysctl-name "hw.cpufrequency")
+  (sysctl-name "hw.tbfrequency_compat")
+  (sysctl-name "hw.vectorunit")
+  (sysctl-name "machdep.cpu.brand_string")
+  (sysctl-name "kern.argmax")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.maxfilesperproc")
+  (sysctl-name "kern.maxproc")
+  (sysctl-name "kern.osproductversion")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.osvariant_status")
+  (sysctl-name "kern.osversion")
+  (sysctl-name "kern.secure_kernel")
+  (sysctl-name "kern.usrstack64")
+  (sysctl-name "kern.version")
+  (sysctl-name "sysctl.proc_cputype")
+  (sysctl-name "vm.loadavg")
+  (sysctl-name-prefix "hw.perflevel")
+  (sysctl-name-prefix "kern.proc.pgrp.")
+  (sysctl-name-prefix "kern.proc.pid.")
+  (sysctl-name-prefix "net.routetable.")
+)
+
+; Allow Java to read some CPU info (misclassified as a "write").
+(allow sysctl-write
+  (sysctl-name "kern.grade_cputype"))
+
+; IOKit
+(allow iokit-open
+  (iokit-registry-entry-class "RootDomainUserClient")
+)
+
+; needed to look up user info
+(allow mach-lookup
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+)
+
+; Needed for Python multiprocessing on macOS for the SemLock
+(allow ipc-posix-sem)
+
+; Needed for PyTorch/libomp on macOS to register OpenMP runtimes.
+(allow ipc-posix-shm-read-data
+  ipc-posix-shm-write-create
+  ipc-posix-shm-write-unlink
+  (ipc-posix-name-regex #"^/__KMP_REGISTERED_LIB_[0-9]+$"))
+
+(allow mach-lookup
+  (global-name "com.apple.PowerManagement.control")
+)
+
+; allow openpty()
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-read* file-write*
+  (require-all
+    (regex #"^/dev/ttys[0-9]+")
+    (extension "com.apple.sandbox.pty")))
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+"))
+
+; allow readonly user preferences
+(allow ipc-posix-shm-read* (ipc-posix-name-prefix "apple.cfprefs."))
+(allow mach-lookup
+  (global-name "com.apple.cfprefsd.daemon")
+  (global-name "com.apple.cfprefsd.agent")
+  (local-name "com.apple.cfprefsd.agent"))
+(allow user-preference-read)
+"""
+
+# Appended only when the policy permits network. Re-grants outbound/inbound
+# plus the DNS/TLS platform lookups a real connection needs under deny-default.
+_SEATBELT_NETWORK_POLICY = r"""
+; network (only when allow_network)
+(allow network-outbound)
+(allow network-inbound)
+(allow system-socket)
+(allow mach-lookup
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.SystemConfiguration.configd")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.ocspd")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.system.opendirectoryd.membership"))
+"""
+
+
+# Paths in a writable root that DeepCode itself acts on later, outside the
+# sandbox: the next session loads the project's hooks (.deepcode/hooks.json,
+# .claude/settings.json) and config from them. A sandboxed command may not
+# create or change them.
+_CONTROL_DIRS = (".deepcode", ".claude")
+_CONTROL_FILE = "deepcode_config.json"
+_CONTROL_PATHS = (*_CONTROL_DIRS, _CONTROL_FILE)
+# In a repository that already exists, the parts of .git that make git run a
+# program (hooks, config) or take those from another git dir (commondir,
+# submodule and linked-worktree git dirs), plus .git itself so it cannot be
+# swapped for one the command wrote. The rest stays writable, so commits and
+# branches still work. A repository the command starts is not covered, which
+# keeps git init working.
+_GIT_CONTROL_PATHS = (
+    "config",
+    "config.worktree",
+    "commondir",
+    "hooks",
+    "modules",
+    "worktrees",
+)
+
+
+def _control_paths(root: str) -> list[str]:
+    """What a sandboxed command may not change inside writable ``root``
+    (besides ``.git`` itself)."""
+    paths = [os.path.join(root, name) for name in _CONTROL_PATHS]
+    git = os.path.join(root, ".git")
+    if os.path.isdir(git):
+        paths += [os.path.join(git, name) for name in _GIT_CONTROL_PATHS]
+    return paths
+
+
+def _sbpl_string(path: str) -> str:
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _sbpl_regex(directory: str, name_glob: str) -> str:
+    """A seatbelt regex for ``name_glob`` (``*`` only) inside ``directory``.
+
+    Each character that is not plainly literal goes in a bracket: seatbelt's
+    regex dialect rejects some backslash escapes (``\\-``).
+    """
+
+    def literal(text: str) -> str:
+        return "".join(
+            ch
+            if ch.isalnum() or ch in "/_-~ ,:@%="
+            else {"^": "\\^", "]": "[]]", "\\": "[\\]"}.get(ch, f"[{ch}]")
+            for ch in text
+        )
+
+    pattern = "[^/]*".join(literal(part) for part in name_glob.split("*"))
+    return f"^{literal(directory)}/{pattern}$"
+
+
+def _public_in(store: str, readable) -> list[str]:
+    """The ``readable`` patterns inside ``store``, relative to it."""
+    prefix = os.path.abspath(store) + os.sep
+    return [
+        pattern[len(prefix) :]
+        for pattern in map(os.path.abspath, readable)
+        if pattern.startswith(prefix)
+    ]
+
+
+def _as_resolved(paths) -> list[str]:
+    """Each path as given and resolved. Seatbelt matches the resolved path (in
+    the filesystem's case), so naming where a path really is also covers it
+    when reached through a symlink."""
+    return list(
+        dict.fromkeys(
+            variant
+            for path in paths
+            for variant in (os.path.abspath(path), os.path.realpath(path))
+        )
+    )
+
+
+def _seatbelt_profile(policy: SandboxPolicy) -> str:
+    """Deny-by-default seatbelt (.sbpl): the curated base + broad reads + writes
+    to ephemeral/device areas and the policy's roots + optional network, minus
+    the roots' control paths and the policy's credential stores."""
+    parts = [
+        _SEATBELT_BASE_POLICY.rstrip(),
+        "",
+        "; broad read-only filesystem access (agents read headers, deps, etc.)",
+        "(allow file-read*)",
+        "",
+        "; writable: ephemeral / device areas a build needs",
+        '(allow file-write* (subpath "/tmp"))',
+        '(allow file-write* (subpath "/private/tmp"))',
+        '(allow file-write* (subpath "/private/var/folders"))',
+        '(allow file-write* (literal "/dev/null"))',
+        '(allow file-write* (literal "/dev/stdout"))',
+        '(allow file-write* (literal "/dev/stderr"))',
+        '(allow file-write-data (regex #"^/dev/tty"))',
+        "",
+        "; writable: the policy's workspace roots",
+    ]
+    roots = policy.normalized_roots()
+    for root in roots:
+        parts.append(f"(allow file-write* (subpath {_sbpl_string(root)}))")
+    if roots:
+        gits = [os.path.join(root, ".git") for root in roots]
+        controls = [path for root in roots for path in _control_paths(root)]
+        parts.append("")
+        parts.append("; control paths in the roots: DeepCode acts on them unsandboxed")
+        parts.append("(deny file-write*")
+        parts.extend(
+            f"  (literal {_sbpl_string(git)})"
+            for git in _as_resolved(git for git in gits if os.path.lexists(git))
+        )
+        parts.extend(
+            f"  (subpath {_sbpl_string(path)})" for path in _as_resolved(controls)
+        )
+        parts[-1] += ")"
+    if policy.unreadable:
+        parts.append("")
+        parts.append("; credential stores: not writable, and not readable")
+        parts.append("; except for the files the policy names as public")
+        parts.append("(deny file-write*")
+        parts.extend(
+            f"  (subpath {_sbpl_string(path)})"
+            for path in _as_resolved(policy.unreadable)
+        )
+        parts[-1] += ")"
+        parts.append("(deny file-read*")
+        for store in policy.unreadable:
+            public = _public_in(store, policy.readable)
+            for path in _as_resolved([store]):
+                keep = "".join(
+                    f' (require-not (regex #"{_sbpl_regex(path, name)}"))'
+                    for name in public
+                )
+                parts.append(
+                    f"  (require-all (subpath {_sbpl_string(path)}){keep})"
+                    if keep
+                    else f"  (subpath {_sbpl_string(path)})"
+                )
+        parts[-1] += ")"
+    if policy.allow_network:
+        parts.append(_SEATBELT_NETWORK_POLICY.rstrip())
+    return "\n".join(parts) + "\n"
+
+
+# bwrap can only mount over a path that exists. A control directory the
+# workspace lacks is held, for as long as a command runs, by an empty
+# placeholder mounted read-only; commands running at once share it.
+_placeholders: dict[str, int] = {}
+_placeholders_lock = threading.Lock()
+
+
+def _hold_placeholder(path: str) -> bool:
+    with _placeholders_lock:
+        if path not in _placeholders:
+            try:
+                os.mkdir(path)
+            except OSError:
+                return False  # it exists (or cannot be made): nothing to hold
+            _placeholders[path] = 0
+        _placeholders[path] += 1
+        return True
+
+
+def _release_placeholder(path: str) -> None:
+    with _placeholders_lock:
+        _placeholders[path] -= 1
+        if _placeholders[path]:
+            return
+        del _placeholders[path]
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass  # DeepCode itself wrote into it meanwhile: it is real now
+
+
+@dataclass
+class WrappedCommand:
+    """A sandboxed command, and what to undo once it has run.
+
+    ``placeholders`` are the empty directories holding bwrap's mounts.
+    ``watched`` is a project config file that did not exist: one that does
+    after the command was made by it (bwrap could not stop that), and is set
+    aside before DeepCode would load it. Callers run :meth:`cleanup` after
+    the command.
+    """
+
+    argv: list[str]
+    backend: str = "none"
+    extra_env: dict[str, str] = field(default_factory=dict)
+    placeholders: list[str] = field(default_factory=list)
+    watched: list[str] = field(default_factory=list)
+
+    def cleanup(self) -> None:
+        for path in self.placeholders:
+            _release_placeholder(path)
+        self.placeholders = []
+        for path in self.watched:
+            if os.path.lexists(path):
+                aside = f"{path}.from-sandbox-{time.time_ns()}"
+                try:
+                    os.rename(path, aside)
+                except OSError:
+                    continue
+                logger.warning(
+                    "A sandboxed command created {}; set aside as {}", path, aside
+                )
+        self.watched = []
+
+
+def wrap_argv_command(
+    inner_argv: list[str],
+    policy: SandboxPolicy,
+) -> WrappedCommand:
+    """Wrap an already-tokenized command (argv list) inside the sandbox.
+
+    Use this for commands that aren't a shell string — e.g. running an
+    interpreter on a script file (``[sys.executable, "/tmp/x.py"]``). When
+    no backend is available the inner argv is returned unchanged with
+    ``backend="none"`` (caller degrades safely).
+    """
+    backend = sandbox_backend()
+
+    if backend == "seatbelt":
+        # Inline, not a file: a profile file would sit in the temp directory,
+        # which sandboxed commands may write, so one still running could
+        # swap the profile of the next command before it starts.
+        argv = [_MACOS_SANDBOX_EXEC, "-p", _seatbelt_profile(policy), *inner_argv]
+        return WrappedCommand(argv=argv, backend=backend)
+
+    if backend == "bwrap":
+        argv = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
+        # Its own process namespace: nothing the command starts outlives it
+        # (to write where the placeholders below no longer stand guard).
+        argv += ["--unshare-pid", "--tmpfs", "/tmp"]
+        placeholders: list[str] = []
+        watched: list[str] = []
+        for root in policy.normalized_roots():
+            if os.path.exists(root):
+                argv += ["--bind", root, root]
+        for root in policy.normalized_roots():
+            # Real paths, as for the stores below: bwrap does not follow a
+            # symlinked destination.
+            git = os.path.realpath(os.path.join(root, ".git"))
+            if os.path.isdir(git):
+                # Mounted on itself: a mount point cannot be moved away.
+                argv += ["--bind", git, git]
+            elif os.path.isfile(git):
+                argv += ["--ro-bind", git, git]
+            for path in map(os.path.realpath, _control_paths(root)):
+                name = os.path.basename(path)
+                if name in _CONTROL_DIRS and _hold_placeholder(path):
+                    placeholders.append(path)
+                if os.path.exists(path):
+                    argv += ["--ro-bind", path, path]
+                elif name == _CONTROL_FILE:
+                    watched.append(path)
+        # Mounted over after the binds so they win even inside a writable
+        # root. bwrap can only mount over what exists; a store that does not
+        # exist has nothing to hide. A symlinked store (dotfile managers) is
+        # masked where it really is: bwrap would not follow the link there.
+        for store in policy.unreadable:
+            path = os.path.realpath(store)
+            if os.path.isdir(path):
+                argv += ["--tmpfs", path]
+                # ... with the files the policy names as public back in it.
+                for name in _public_in(store, policy.readable):
+                    for public in sorted(glob.glob(os.path.join(path, name))):
+                        if os.path.isfile(public):
+                            argv += ["--ro-bind", public, public]
+            elif os.path.exists(path):
+                argv += ["--ro-bind", "/dev/null", path]
+        if not policy.allow_network:
+            argv += ["--unshare-net"]
+        argv += ["--die-with-parent", *inner_argv]
+        return WrappedCommand(
+            argv=argv, backend=backend, placeholders=placeholders, watched=watched
+        )
+
+    if backend == "job":
+        # Windows Job Object launcher: same wrapper pattern as seatbelt/bwrap.
+        # ``python windows_sandbox.py -- <inner argv...>`` creates a
+        # KILL_ON_JOB_CLOSE job, spawns the inner command into it suspended,
+        # and resumes it — the whole process tree dies with the wrapper. It
+        # runs by path, not ``-m``: it needs only the standard library, and a
+        # command's environment does not carry DeepCode's PYTHONPATH.
+        argv = [*script_command(_WINDOWS_JOB_LAUNCHER), "--", *inner_argv]
+        return WrappedCommand(argv=argv, backend=backend)
+
+    return WrappedCommand(argv=list(inner_argv), backend="none")
+
+
+def default_shell() -> str:
+    """The bash a shell command runs in.
+
+    Windows has no ``/bin/bash``. Git for Windows keeps ``bash.exe`` in
+    ``bin`` beside the ``cmd`` directory its installer puts on PATH; failing
+    that, any ``bash`` on PATH (MSYS2, Cygwin, ...) except the WSL launcher,
+    which runs a Linux distro instead of the user's Windows tools. Raises
+    :class:`FileNotFoundError` when there is none.
+    """
+    if platform.system() != "Windows":
+        return "/bin/bash"
+    git = shutil.which("git")
+    if git:
+        bash = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+        if bash.is_file():
+            return str(bash)
+    bash = shutil.which("bash")
+    if bash and not _is_wsl_launcher(bash):
+        return bash
+    raise FileNotFoundError(
+        "Git for Windows bash not found; install Git for Windows "
+        "(https://git-scm.com/download/win) to run shell commands"
+    )
+
+
+def _is_wsl_launcher(path: str) -> bool:
+    """``bash.exe`` in the Windows directory or a Store app alias starts WSL."""
+
+    lowered = path.replace("/", "\\").lower()
+    windows = os.environ.get("SystemRoot", "C:\\Windows").replace("/", "\\").lower()
+    return (
+        lowered.startswith(windows.rstrip("\\") + "\\") or "\\windowsapps\\" in lowered
+    )
+
+
+def wrap_shell_command(
+    command: str,
+    policy: SandboxPolicy,
+    *,
+    shell: str | None = None,
+) -> WrappedCommand:
+    """Wrap a shell ``command`` string so it runs inside the sandbox.
+
+    Returns a :class:`WrappedCommand`. When no backend is available the
+    argv falls back to ``[shell, -c, command]`` with ``backend="none"`` —
+    the caller is responsible for degrading safely (e.g. requiring approval
+    or refusing network-touching commands).
+    """
+    return wrap_argv_command([shell or default_shell(), "-c", command], policy)
+
+
+def sandbox_available() -> bool:
+    return sandbox_backend() != "none"
+
+
+def sandbox_enabled(configured: bool | None = None) -> bool:
+    """Resolve whether command sandboxing is enabled.
+
+    ``DEEPCODE_SANDBOX`` accepts ``0``/``false``/``off``/``no`` to disable;
+    any other *non-empty* value enables it.  When the variable is absent,
+    ``configured`` is used, falling back to the legacy default (enabled).
+    Keeping environment resolution here preserves the public escape hatch
+    while allowing a frozen execution profile to pass an explicit decision to
+    :func:`build_exec_command`.
+
+    The explicit Full Access profile also disables the permission engine's
+    sensitive-path protection; legacy sandbox toggles do not.
+    """
+    raw = os.environ.get("DEEPCODE_SANDBOX", "").strip().lower()
+    if raw:
+        return raw not in ("0", "false", "off", "no")
+    return True if configured is None else configured
+
+
+def build_exec_command(
+    *,
+    command: str | None = None,
+    argv: list[str] | None = None,
+    workspace: str | os.PathLike[str],
+    allow_network: bool = True,
+    shell: str | None = None,
+    enabled: bool | None = None,
+) -> WrappedCommand:
+    """Build the (possibly sandboxed) command a tool executor should run.
+
+    Exactly one of ``command`` (shell string) or ``argv`` (token list) must
+    be given. Applies the workspace write-fence when sandboxing is enabled
+    and a backend is available; otherwise returns the bare command flagged
+    ``backend="none"``/``"disabled"`` so the caller can log the degradation.
+
+    ``allow_network`` defaults to ``True``: coding tasks routinely need pip /
+    downloads, so the executor keeps the filesystem write-fence (the high-
+    value, low-breakage protection) while leaving the network open. Callers
+    that want strict isolation pass ``allow_network=False``.
+    """
+    if (command is None) == (argv is None):
+        raise ValueError("provide exactly one of command= or argv=")
+
+    # ``enabled`` is the immutable per-execution value used by product access
+    # presets.  ``None`` intentionally retains the legacy env/default behavior
+    # for direct embedders that have not adopted ExecutionSecurityProfile yet.
+    effective_enabled = sandbox_enabled() if enabled is None else enabled
+    if not effective_enabled:
+        bare = (
+            [shell or default_shell(), "-c", command]
+            if command is not None
+            else list(argv or [])
+        )
+        return WrappedCommand(argv=bare, backend="disabled")
+
+    policy = SandboxPolicy.for_workspace(workspace, allow_network=allow_network)
+    if command is not None:
+        return wrap_shell_command(command, policy, shell=shell)
+    return wrap_argv_command(list(argv or []), policy)
+
+
+#: Backends that confine writes to the policy's writable roots. The Job Object
+#: backend deliberately does not (see the module docstring): it isolates the
+#: process tree but leaves the filesystem open, so callers must not advertise a
+#: write-fence on Windows.
+_WRITE_FENCING_BACKENDS = frozenset({"seatbelt", "bwrap"})
+
+
+def fences_writes() -> bool:
+    """Whether the active backend actually confines writes to the workspace."""
+    return sandbox_backend() in _WRITE_FENCING_BACKENDS
+
+
+def describe_backend() -> str:
+    """Human-readable one-liner for logs/prompts."""
+    backend = sandbox_backend()
+    return {
+        "seatbelt": "macOS seatbelt (sandbox-exec)",
+        "bwrap": "Linux bubblewrap (bwrap)",
+        "job": "Windows Job Object (process-tree isolation)",
+        "none": "no sandbox (degraded: approval-first)",
+    }[backend]
