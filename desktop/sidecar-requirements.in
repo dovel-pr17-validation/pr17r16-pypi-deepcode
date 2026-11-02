@@ -9,7 +9,7 @@ json-repair==0.61.4
 loguru==0.7.3
 mcp==1.29.0
 openai==2.29.0
-prompt-toolkit==3.0.52
+prompt-toolkit==3.0.53
 pydantic==2.12.5
 pydantic-settings==2.14.2
 pypdf==6.19.0
